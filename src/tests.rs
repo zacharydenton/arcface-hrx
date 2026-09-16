@@ -412,9 +412,8 @@ fn insightface_fixture() -> Result<()> {
     let got = model.embed(&rgb, w as usize, h as usize, &landmarks)?;
     let readback = model.context().runtime().statistics().downloaded_bytes - before;
     assert_eq!(
-        readback,
-        (landmarks.len() * (EMBEDDING + 1) * 4) as u64,
-        "only embeddings and geometry status cross back to the host"
+        readback, 0,
+        "host-visible embeddings and geometry status need no explicit readback copy"
     );
     assert_eq!(got, model.embed(&rgb, w as usize, h as usize, &landmarks)?);
     let image = model.context().upload(
@@ -449,6 +448,62 @@ fn insightface_fixture() -> Result<()> {
         for j in 0..got.len() {
             assert!((cosine(&got[i], &got[j]) - cosine(&expected[i], &expected[j])).abs() < 0.001);
             assert!((cosine(&got[i], &got[j]) - cosine(&legacy[i], &legacy[j])).abs() < 0.001);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires pretrained weights and gfx1151"]
+fn convolution_tiles_preserve_embeddings_across_batch_boundaries() -> Result<()> {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../tests/fixtures/t1_arcface.json"))?;
+    let image = image::load_from_memory(include_bytes!("../tests/fixtures/t1.png"))?.to_rgb8();
+    let landmarks: Vec<[[f32; 2]; 5]> = fixture["faces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|face| serde_json::from_value(face["kps"].clone()))
+        .collect::<std::result::Result<_, _>>()?;
+    let model = ArcFace::load(
+        model_path()?,
+        Options {
+            max_batch: 64,
+            ..Default::default()
+        },
+    )?;
+    let run = |points: &[[[f32; 2]; 5]]| {
+        model.embed(
+            &image,
+            image.width() as usize,
+            image.height() as usize,
+            points,
+        )
+    };
+    let reference = landmarks
+        .iter()
+        .map(|points| Ok(run(std::slice::from_ref(points))?[0]))
+        .collect::<Result<Vec<_>>>()?;
+    // Odd/tail tile counts, multiple workgroups and the maximum supported batch.
+    // Change face order on replay to catch stale input/output tile storage.
+    for batch in [1, 2, 3, 6, 16, 32, 64] {
+        let points: Vec<_> = (0..batch).map(|i| landmarks[i % landmarks.len()]).collect();
+        let _ = run(&points)?;
+        let points: Vec<_> = (0..batch)
+            .map(|i| landmarks[(i + 1) % landmarks.len()])
+            .collect();
+        let before = model.context().runtime().statistics();
+        let actual = run(&points)?;
+        let after = model.context().runtime().statistics();
+        assert_eq!(after.allocations, before.allocations);
+        assert_eq!(after.copied_bytes, before.copied_bytes);
+        assert_eq!(after.submissions - before.submissions, 1);
+        for (i, embedding) in actual.iter().enumerate() {
+            assert_eq!(
+                embedding,
+                &reference[(i + 1) % reference.len()],
+                "batch {batch}, row {i}"
+            );
         }
     }
     Ok(())

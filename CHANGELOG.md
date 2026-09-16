@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Use HRX 0.7 graph composition and directly mapped input/output storage.
+- Double convolution reduction tiles and reuse shared staging memory for output
+  tiles while preserving ordered accumulation and exact single/batch embeddings.
+- Test batch boundaries through 64 faces and allocation-free warm replay.
+
 - Use HRX 0.5's shared Hugging Face resolver, checked ONNX loader, scratch
   planner, compiler selection, and top-level `hrx::model` API.
 - Accept packed RGB images and aligned crops in `embed`, `embeddings`, `alignment::crop`, and the CLI. BGR callers must swap red and blue before calling.

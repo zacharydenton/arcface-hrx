@@ -1,19 +1,10 @@
-// 3x3 convolution, pad 1, stride 1 or 2, as an implicit GEMM on the 128-wide-N WMMA
-// staged-LDS matmul from dinov3-hrx, by way of scrfd-hrx. Everything about that kernel is kept --
-// the W staging, the k-loop, the LDS budget, the epilogue -- except the one load
-// that stages a row of A: that load is now the im2col gather, so the [M][K]
-// matrix never exists.
-//
-//   C[(b*Ho + yo)*Wo + xo, n] = bias[n] + sum_k A_gathered[row, k] * W[n, k]
-//     with k = (dy*3 + dx)*Cin_pad + c, reading in[(b*H + yi)*W + xi, c] for
-//     yi = yo*stride + dy - 1, xi = xo*stride + dx - 1, zero outside the image.
-//
-// A is NHWC f16 [B*H*W][Cin_stride]; W is [Cout_pad][K_pad] f16 in that k order
-// (the model importer); C is NHWC f16 [B*Ho*Wo][n_size]. f32 accumulate.
-// Cin_pad and Cin_stride are multiples of 8: each lane gathers one row x
-// vector<8xf16> per k-step, so a packet never straddles a tap.
-//
-//
+// Implicit 3x3 NHWC convolution, pad 1, stride 1 or 2.
+// Stages 64 reduction columns at a time, preserving the original ordered
+// 16-wide WMMA accumulations while halving workgroup barriers. Each lane
+// gathers 16 f16 channels; cin_pad must be a multiple of 16 so packets do
+// not cross taps. The eight-channel RGB stem uses its separate kernel.
+// Input/weight LDS is reused for per-wave output tiles only after the final
+// k-loop workgroup barrier. No input tile remains live at that point.
 amdgpu.target<gfx11-generic> @arcface_conv3x3_n128_f16_wmma_bnprelu_gfx11 {subgroup_size = 32}
 
 // Input height/width (NHWC, Cin_stride channels), stride, gather width and row
@@ -26,13 +17,10 @@ config.decl @arcface.conv3x3_n128_f16_wmma_bnprelu.width : %value: index where [
 
 config.decl @arcface.conv3x3_n128_f16_wmma_bnprelu.stride : %value: index where [range(%value, 1, 2)]
 
-config.decl @arcface.conv3x3_n128_f16_wmma_bnprelu.cin_pad : %value: index where [range(%value, 8, 1024), mul(%value, 8)]
+config.decl @arcface.conv3x3_n128_f16_wmma_bnprelu.cin_pad : %value: index where [range(%value, 16, 1024), mul(%value, 16)]
 
-// Physical channel stride of the input rows: the width its producer wrote,
-// which is that conv's Cout_pad (64-aligned), or 4 for the stem's converted
-// image. The gather reads only c < cin_pad inside each row, so the MMA work is
-// 9*cin_pad, not 9*cin_stride -- for an 88-channel tensor stored 128 wide that
-// is the difference between K=800 and K=1152.
+// Physical channel stride written by the preceding convolution. Gather only
+// cin_pad channels per tap, without reading extra physical row padding.
 config.decl @arcface.conv3x3_n128_f16_wmma_bnprelu.cin_stride : %value: index where [range(%value, 8, 1024), mul(%value, 8)]
 
 config.decl @arcface.conv3x3_n128_f16_wmma_bnprelu.k_size : %value: index where [range(%value, 32, 16384), mul(%value, 32)]
@@ -68,14 +56,14 @@ kernel.def target(@arcface_conv3x3_n128_f16_wmma_bnprelu_gfx11) export("arcface_
   %c8 = index.constant 8 : index
   %c16 = index.constant 16 : index
   %c32 = index.constant 32 : index
-  %c40 = index.constant 40 : index
+  %c72 = index.constant 72 : index
   %c48 = index.constant 48 : index
   %c64 = index.constant 64 : index
   %c128 = index.constant 128 : index
   %c256 = index.constant 256 : index
   %c0_offset = index.constant 0 : offset
-  %lds_bytes = index.constant 15360 : offset
-  %w_stage_offset = index.constant 5120 : offset
+  %lds_bytes = index.constant 27648 : offset
+  %w_stage_offset = index.constant 9216 : offset
   %wave_result_bytes = index.constant 1024 : offset
   %m = index.constant 16 : index
   %n = index.constant 16 : index
@@ -83,7 +71,7 @@ kernel.def target(@arcface_conv3x3_n128_f16_wmma_bnprelu_gfx11) export("arcface_
   %zero_f32x8 = vector.constant 0.0 : vector<8xf32>
   %zero_f16x4 = vector.constant 0.0 : vector<4xf16>
   %zero_f32x4 = vector.constant 0.0 : vector<4xf32>
-  %zero_f16x8 = vector.constant 0.0 : vector<8xf16>
+  %zero_f16x16 = vector.constant 0.0 : vector<16xf16>
 
   %tile_n_id = kernel.workgroup.id<x> : index
   %tile_m_id = kernel.workgroup.id<y> : index
@@ -118,7 +106,7 @@ kernel.def target(@arcface_conv3x3_n128_f16_wmma_bnprelu_gfx11) export("arcface_
   %in_rows_per_image = index.mul %height, %width : index
   %in_rows_total = index.mul %images, %in_rows_per_image : index
   %k_real = index.mul %cin_pad, %c9 : index
-  %c_limit = index.sub %cin_pad, %c8 : index
+  %c_limit = index.sub %cin_pad, %c16 : index
   %a_view = buffer.view %a_global[%c0_offset] : buffer -> view<[%in_rows_total]x[%cin_stride]xf16>
   %w_view = buffer.view %w_global[%c0_offset] : buffer -> view<[%n_size]x[%k_size]xf16>
   %bias_view = buffer.view %bias_global[%c0_offset] : buffer -> view<[%c9]x[%n_size]xf32>
@@ -126,20 +114,20 @@ kernel.def target(@arcface_conv3x3_n128_f16_wmma_bnprelu_gfx11) export("arcface_
   %slope_global = buffer.assume.memory_space<global> %slope : buffer
   %slope_view = buffer.view %slope_global[%c0_offset] : buffer -> view<[%n_size]xf32>
 
-  // One allocation: A at 0, W at 5120, and after the k-loop the eight waves'
+  // One allocation: A at 0, W at 9216, and after the k-loop the eight waves'
   // 16x16 f32 result tiles over the dead stages.
   %lds = buffer.alloca<workgroup> align(16) %lds_bytes : buffer
-  %a_stage_view = buffer.view %lds[%c0_offset] : buffer -> view<64x40xf16>
-  %w_stage_view = buffer.view %lds[%w_stage_offset] : buffer -> view<128x40xf16>
+  %a_stage_view = buffer.view %lds[%c0_offset] : buffer -> view<64x72xf16>
+  %w_stage_view = buffer.view %lds[%w_stage_offset] : buffer -> view<128x72xf16>
   // The rhs fragment wants logical [k][n]; the staged weight tile is physically
-  // [n][k] with a 40-element row, so a strided layout reads it transposed.
-  %w_fragment_layout = encoding.layout.strided [1, %c40] : encoding<layout>
-  %w_fragment_view = buffer.view %lds[%w_stage_offset] : buffer -> view<32x128xf16, %w_fragment_layout>
+  // [n][k] with a 72-element row, so a strided layout reads it transposed.
+  %w_fragment_layout = encoding.layout.strided [1, %c72] : encoding<layout>
+  %w_fragment_view = buffer.view %lds[%w_stage_offset] : buffer -> view<64x128xf16, %w_fragment_layout>
   %wave_result_offset = index.scale %subgroup, %wave_result_bytes : index, offset -> offset
   %result_view = buffer.view %lds[%wave_result_offset] : buffer -> view<16x16xf32>
 
   %load_packet = index.rem %workitem, %c4 : index
-  %load_k = index.mul %load_packet, %c8 : index
+  %load_k = index.mul %load_packet, %c16 : index
   %load_row0 = index.div %workitem, %c4 : index
   %load_row = index.assume %load_row0 [range(%load_row0, 0, 63)] : index
 
@@ -177,7 +165,7 @@ kernel.def target(@arcface_conv3x3_n128_f16_wmma_bnprelu_gfx11) export("arcface_
   // is tested exactly against NumPy.
   %in_k_first = index.cmp ult, %source_k_first, %k_real : index
   %gathers_first = scalar.andi %m_in_range_first, %in_k_first : i1
-  %a_values_first = scf.if %gathers_first -> (vector<8xf16>) {
+  %a_values_first = scf.if %gathers_first -> (vector<16xf16>) {
     %ys_first = index.add %h_ys0, %c0 : index
     %xs_first = index.add %h_xs0, %c0 : index
     %image_rows_first = index.add %h_rows0, %c0 : index
@@ -196,7 +184,7 @@ kernel.def target(@arcface_conv3x3_n128_f16_wmma_bnprelu_gfx11) export("arcface_
     %y_ok_first = scalar.andi %y_low_first, %y_high_first : i1
     %x_ok_first = scalar.andi %x_low_first, %x_high_first : i1
     %inside_first = scalar.andi %y_ok_first, %x_ok_first : i1
-    %loaded_first = scf.if %inside_first -> (vector<8xf16>) {
+    %loaded_first = scf.if %inside_first -> (vector<16xf16>) {
       %yi0_first = index.sub %y0_first, %c1 : index
       %xi0_first = index.sub %x0_first, %c1 : index
       %yi_first = index.assume %yi0_first [lt(%yi0_first, %height)] : index
@@ -205,40 +193,40 @@ kernel.def target(@arcface_conv3x3_n128_f16_wmma_bnprelu_gfx11) export("arcface_
       %row_yw_first = index.mul %row_y0_first, %width : index
       %in_row0_first = index.add %row_yw_first, %xi_first : index
       %in_row_first = index.assume %in_row0_first [lt(%in_row0_first, %in_rows_total)] : index
-      %c_col_first = index.assume %c_first [le(%c_first, %c_limit), mul(%c_first, 8)] : index
-      %v_first = vector.load %a_view[%in_row_first, %c_col_first] : view<[%in_rows_total]x[%cin_stride]xf16> -> vector<8xf16>
-      scf.yield %v_first : vector<8xf16>
+      %c_col_first = index.assume %c_first [le(%c_first, %c_limit), mul(%c_first, 16)] : index
+      %v_first = vector.load %a_view[%in_row_first, %c_col_first] : view<[%in_rows_total]x[%cin_stride]xf16> -> vector<16xf16>
+      scf.yield %v_first : vector<16xf16>
     } else {
-      scf.yield %zero_f16x8 : vector<8xf16>
+      scf.yield %zero_f16x16 : vector<16xf16>
     }
-    scf.yield %loaded_first : vector<8xf16>
+    scf.yield %loaded_first : vector<16xf16>
   } else {
-    scf.yield %zero_f16x8 : vector<8xf16>
+    scf.yield %zero_f16x16 : vector<16xf16>
   }
   %source_n_first = index.add %base_n, %load_row : index
   %source_n_hi_first = index.add %base_n, %w_row_hi : index
   %w_in_k_first = index.cmp ult, %source_k_first, %k_size : index
-  %w_values_first = scf.if %w_in_k_first -> (vector<8xf16>) {
+  %w_values_first = scf.if %w_in_k_first -> (vector<16xf16>) {
     %w_k_first = index.assume %source_k_first [lt(%source_k_first, %k_size)] : index
-    %w_loaded_first = vector.load %w_view[%source_n_first, %w_k_first] : view<[%n_size]x[%k_size]xf16> -> vector<8xf16>
-    scf.yield %w_loaded_first : vector<8xf16>
+    %w_loaded_first = vector.load %w_view[%source_n_first, %w_k_first] : view<[%n_size]x[%k_size]xf16> -> vector<16xf16>
+    scf.yield %w_loaded_first : vector<16xf16>
   } else {
-    scf.yield %zero_f16x8 : vector<8xf16>
+    scf.yield %zero_f16x16 : vector<16xf16>
   }
   %w_in_k_hi_first = index.cmp ult, %source_k_first, %k_size : index
-  %w_values_hi_first = scf.if %w_in_k_hi_first -> (vector<8xf16>) {
+  %w_values_hi_first = scf.if %w_in_k_hi_first -> (vector<16xf16>) {
     %w_k_hi_first = index.assume %source_k_first [lt(%source_k_first, %k_size)] : index
-    %w_loaded_hi_first = vector.load %w_view[%source_n_hi_first, %w_k_hi_first] : view<[%n_size]x[%k_size]xf16> -> vector<8xf16>
-    scf.yield %w_loaded_hi_first : vector<8xf16>
+    %w_loaded_hi_first = vector.load %w_view[%source_n_hi_first, %w_k_hi_first] : view<[%n_size]x[%k_size]xf16> -> vector<16xf16>
+    scf.yield %w_loaded_hi_first : vector<16xf16>
   } else {
-    scf.yield %zero_f16x8 : vector<8xf16>
+    scf.yield %zero_f16x16 : vector<16xf16>
   }
-  %acc0, %acc1, %acc2, %acc3, %a_values_last, %w_values_last, %w_values_hi_last = scf.for %k_base = [%c0 to %k_size step %c32](%run0 = %acc_init0 : vector<8xf32>, %run1 = %acc_init1 : vector<8xf32>, %run2 = %acc_init2 : vector<8xf32>, %run3 = %acc_init3 : vector<8xf32>, %a_cur = %a_values_first : vector<8xf16>, %w_cur = %w_values_first : vector<8xf16>, %w_cur_hi = %w_values_hi_first : vector<8xf16>) -> (vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf16>, vector<8xf16>, vector<8xf16>) {
-    vector.store %a_cur, %a_stage_view[%load_row, %load_k] : vector<8xf16>, view<64x40xf16>
-    vector.store %w_cur, %w_stage_view[%load_row, %load_k] : vector<8xf16>, view<128x40xf16>
-    vector.store %w_cur_hi, %w_stage_view[%w_row_hi, %load_k] : vector<8xf16>, view<128x40xf16>
+  %acc0, %acc1, %acc2, %acc3, %a_values_last, %w_values_last, %w_values_hi_last = scf.for %k_base = [%c0 to %k_size step %c64](%run0 = %acc_init0 : vector<8xf32>, %run1 = %acc_init1 : vector<8xf32>, %run2 = %acc_init2 : vector<8xf32>, %run3 = %acc_init3 : vector<8xf32>, %a_cur = %a_values_first : vector<16xf16>, %w_cur = %w_values_first : vector<16xf16>, %w_cur_hi = %w_values_hi_first : vector<16xf16>) -> (vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<16xf16>, vector<16xf16>, vector<16xf16>) {
+    vector.store %a_cur, %a_stage_view[%load_row, %load_k] : vector<16xf16>, view<64x72xf16>
+    vector.store %w_cur, %w_stage_view[%load_row, %load_k] : vector<16xf16>, view<128x72xf16>
+    vector.store %w_cur_hi, %w_stage_view[%w_row_hi, %load_k] : vector<16xf16>, view<128x72xf16>
     kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
-    %k_next = index.add %k_base, %c32 : index
+    %k_next = index.add %k_base, %c64 : index
     %source_k_next = index.add %k_next, %load_k : index
     %row_next = index.add %load_row, %c0 : index
     %source_m_next = index.add %base_m, %row_next : index
@@ -249,7 +237,7 @@ kernel.def target(@arcface_conv3x3_n128_f16_wmma_bnprelu_gfx11) export("arcface_
     // is tested exactly against NumPy.
     %in_k_next = index.cmp ult, %source_k_next, %k_real : index
     %gathers_next = scalar.andi %m_in_range_next, %in_k_next : i1
-    %a_values_next = scf.if %gathers_next -> (vector<8xf16>) {
+    %a_values_next = scf.if %gathers_next -> (vector<16xf16>) {
       %ys_next = index.add %h_ys0, %c0 : index
       %xs_next = index.add %h_xs0, %c0 : index
       %image_rows_next = index.add %h_rows0, %c0 : index
@@ -268,7 +256,7 @@ kernel.def target(@arcface_conv3x3_n128_f16_wmma_bnprelu_gfx11) export("arcface_
       %y_ok_next = scalar.andi %y_low_next, %y_high_next : i1
       %x_ok_next = scalar.andi %x_low_next, %x_high_next : i1
       %inside_next = scalar.andi %y_ok_next, %x_ok_next : i1
-      %loaded_next = scf.if %inside_next -> (vector<8xf16>) {
+      %loaded_next = scf.if %inside_next -> (vector<16xf16>) {
         %yi0_next = index.sub %y0_next, %c1 : index
         %xi0_next = index.sub %x0_next, %c1 : index
         %yi_next = index.assume %yi0_next [lt(%yi0_next, %height)] : index
@@ -277,40 +265,40 @@ kernel.def target(@arcface_conv3x3_n128_f16_wmma_bnprelu_gfx11) export("arcface_
         %row_yw_next = index.mul %row_y0_next, %width : index
         %in_row0_next = index.add %row_yw_next, %xi_next : index
         %in_row_next = index.assume %in_row0_next [lt(%in_row0_next, %in_rows_total)] : index
-        %c_col_next = index.assume %c_next [le(%c_next, %c_limit), mul(%c_next, 8)] : index
-        %v_next = vector.load %a_view[%in_row_next, %c_col_next] : view<[%in_rows_total]x[%cin_stride]xf16> -> vector<8xf16>
-        scf.yield %v_next : vector<8xf16>
+        %c_col_next = index.assume %c_next [le(%c_next, %c_limit), mul(%c_next, 16)] : index
+        %v_next = vector.load %a_view[%in_row_next, %c_col_next] : view<[%in_rows_total]x[%cin_stride]xf16> -> vector<16xf16>
+        scf.yield %v_next : vector<16xf16>
       } else {
-        scf.yield %zero_f16x8 : vector<8xf16>
+        scf.yield %zero_f16x16 : vector<16xf16>
       }
-      scf.yield %loaded_next : vector<8xf16>
+      scf.yield %loaded_next : vector<16xf16>
     } else {
-      scf.yield %zero_f16x8 : vector<8xf16>
+      scf.yield %zero_f16x16 : vector<16xf16>
     }
     %source_n_next = index.add %base_n, %load_row : index
     %source_n_hi_next = index.add %base_n, %w_row_hi : index
     %w_in_k_next = index.cmp ult, %source_k_next, %k_size : index
-    %w_values_next = scf.if %w_in_k_next -> (vector<8xf16>) {
+    %w_values_next = scf.if %w_in_k_next -> (vector<16xf16>) {
       %w_k_next = index.assume %source_k_next [lt(%source_k_next, %k_size)] : index
-      %w_loaded_next = vector.load %w_view[%source_n_next, %w_k_next] : view<[%n_size]x[%k_size]xf16> -> vector<8xf16>
-      scf.yield %w_loaded_next : vector<8xf16>
+      %w_loaded_next = vector.load %w_view[%source_n_next, %w_k_next] : view<[%n_size]x[%k_size]xf16> -> vector<16xf16>
+      scf.yield %w_loaded_next : vector<16xf16>
     } else {
-      scf.yield %zero_f16x8 : vector<8xf16>
+      scf.yield %zero_f16x16 : vector<16xf16>
     }
     %w_in_k_hi_next = index.cmp ult, %source_k_next, %k_size : index
-    %w_values_hi_next = scf.if %w_in_k_hi_next -> (vector<8xf16>) {
+    %w_values_hi_next = scf.if %w_in_k_hi_next -> (vector<16xf16>) {
       %w_k_hi_next = index.assume %source_k_next [lt(%source_k_next, %k_size)] : index
-      %w_loaded_hi_next = vector.load %w_view[%source_n_hi_next, %w_k_hi_next] : view<[%n_size]x[%k_size]xf16> -> vector<8xf16>
-      scf.yield %w_loaded_hi_next : vector<8xf16>
+      %w_loaded_hi_next = vector.load %w_view[%source_n_hi_next, %w_k_hi_next] : view<[%n_size]x[%k_size]xf16> -> vector<16xf16>
+      scf.yield %w_loaded_hi_next : vector<16xf16>
     } else {
-      scf.yield %zero_f16x8 : vector<8xf16>
+      scf.yield %zero_f16x16 : vector<16xf16>
     }
-    %next0, %next1, %next2, %next3 = scf.for %k_half = [%c0 to %c32 step %c16](%half0 = %run0 : vector<8xf32>, %half1 = %run1 : vector<8xf32>, %half2 = %run2 : vector<8xf32>, %half3 = %run3 : vector<8xf32>) -> (vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>) unroll {
-      %lhs = vector.fragment.load<lhs> %a_stage_view[%wave_row, %k_half] shape [%m, %k] : view<64x40xf16> -> vector<16xf16>
-      %rhs0 = vector.fragment.load<rhs> %w_fragment_view[%k_half, %wave_col] shape [%k, %n] : view<32x128xf16, %w_fragment_layout> -> vector<16xf16>
-      %rhs1 = vector.fragment.load<rhs> %w_fragment_view[%k_half, %wave_col1] shape [%k, %n] : view<32x128xf16, %w_fragment_layout> -> vector<16xf16>
-      %rhs2 = vector.fragment.load<rhs> %w_fragment_view[%k_half, %wave_col2] shape [%k, %n] : view<32x128xf16, %w_fragment_layout> -> vector<16xf16>
-      %rhs3 = vector.fragment.load<rhs> %w_fragment_view[%k_half, %wave_col3] shape [%k, %n] : view<32x128xf16, %w_fragment_layout> -> vector<16xf16>
+    %next0, %next1, %next2, %next3 = scf.for %k_half = [%c0 to %c64 step %c16](%half0 = %run0 : vector<8xf32>, %half1 = %run1 : vector<8xf32>, %half2 = %run2 : vector<8xf32>, %half3 = %run3 : vector<8xf32>) -> (vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>) unroll {
+      %lhs = vector.fragment.load<lhs> %a_stage_view[%wave_row, %k_half] shape [%m, %k] : view<64x72xf16> -> vector<16xf16>
+      %rhs0 = vector.fragment.load<rhs> %w_fragment_view[%k_half, %wave_col] shape [%k, %n] : view<64x128xf16, %w_fragment_layout> -> vector<16xf16>
+      %rhs1 = vector.fragment.load<rhs> %w_fragment_view[%k_half, %wave_col1] shape [%k, %n] : view<64x128xf16, %w_fragment_layout> -> vector<16xf16>
+      %rhs2 = vector.fragment.load<rhs> %w_fragment_view[%k_half, %wave_col2] shape [%k, %n] : view<64x128xf16, %w_fragment_layout> -> vector<16xf16>
+      %rhs3 = vector.fragment.load<rhs> %w_fragment_view[%k_half, %wave_col3] shape [%k, %n] : view<64x128xf16, %w_fragment_layout> -> vector<16xf16>
       %out0 = vector.mma %lhs, %rhs0, %half0 : vector<16xf16>, vector<16xf16>, vector<8xf32>
       %out1 = vector.mma %lhs, %rhs1, %half1 : vector<16xf16>, vector<16xf16>, vector<8xf32>
       %out2 = vector.mma %lhs, %rhs2, %half2 : vector<16xf16>, vector<16xf16>, vector<8xf32>
@@ -318,7 +306,7 @@ kernel.def target(@arcface_conv3x3_n128_f16_wmma_bnprelu_gfx11) export("arcface_
       scf.yield %out0, %out1, %out2, %out3 : vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>
     }
     kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)
-    scf.yield %next0, %next1, %next2, %next3, %a_values_next, %w_values_next, %w_values_hi_next : vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf16>, vector<8xf16>, vector<8xf16>
+    scf.yield %next0, %next1, %next2, %next3, %a_values_next, %w_values_next, %w_values_hi_next : vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<8xf32>, vector<16xf16>, vector<16xf16>, vector<16xf16>
   }
 
   // Publish through LDS: each lane takes two vector4 slices of the 16x16 tile.

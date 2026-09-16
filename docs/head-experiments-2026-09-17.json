@@ -1,0 +1,136 @@
+{
+  "split-56": [
+    {
+      "median_ms": 2.4021950000000003,
+      "p95_ms": 2.4275640000000003,
+      "samples": 200,
+      "scope": "warm end-to-end, including transfers",
+      "setup_ms": 372.23334600000004
+    }
+  ],
+  "split-49": [
+    {
+      "median_ms": 2.5368220000000004,
+      "p95_ms": 2.5751709999999997,
+      "samples": 200,
+      "scope": "warm end-to-end, including transfers",
+      "setup_ms": 358.065458
+    }
+  ],
+  "split-14": [
+    {
+      "median_ms": 2.391346,
+      "p95_ms": 2.4287940000000003,
+      "samples": 200,
+      "scope": "warm end-to-end, including transfers",
+      "setup_ms": 353.660407
+    }
+  ],
+  "split-7": [
+    {
+      "median_ms": 2.460324,
+      "p95_ms": 2.498723,
+      "samples": 200,
+      "scope": "warm end-to-end, including transfers",
+      "setup_ms": 365.583265
+    }
+  ],
+  "split-28": [
+    {
+      "median_ms": 2.396725,
+      "p95_ms": 2.4240350000000004,
+      "samples": 200,
+      "scope": "warm end-to-end, including transfers",
+      "setup_ms": 484.477326
+    },
+    {
+      "median_ms": 2.377626,
+      "p95_ms": 2.407185,
+      "samples": 200,
+      "scope": "warm end-to-end, including transfers",
+      "setup_ms": 351.762418
+    }
+  ],
+  "b6-56": [
+    {
+      "median_ms": 4.377372,
+      "p95_ms": 4.433311,
+      "samples": 150,
+      "scope": "warm end-to-end, including transfers",
+      "setup_ms": 352.823193
+    }
+  ],
+  "b6-7": [
+    {
+      "median_ms": 4.465618999999999,
+      "p95_ms": 4.498488999999999,
+      "samples": 150,
+      "scope": "warm end-to-end, including transfers",
+      "setup_ms": 349.57052999999996
+    }
+  ],
+  "b6-14": [
+    {
+      "median_ms": 4.401142,
+      "p95_ms": 4.441129999999999,
+      "samples": 150,
+      "scope": "warm end-to-end, including transfers",
+      "setup_ms": 344.950624
+    },
+    {
+      "median_ms": 4.350142000000001,
+      "p95_ms": 4.382892,
+      "samples": 150,
+      "scope": "warm end-to-end, including transfers",
+      "setup_ms": 372.75338600000003
+    }
+  ],
+  "b6-28": [
+    {
+      "median_ms": 4.394642,
+      "p95_ms": 4.437151,
+      "samples": 150,
+      "scope": "warm end-to-end, including transfers",
+      "setup_ms": 487.021656
+    },
+    {
+      "median_ms": 4.323504,
+      "p95_ms": 4.405861,
+      "samples": 150,
+      "scope": "warm end-to-end, including transfers",
+      "setup_ms": 350.296261
+    }
+  ],
+  "pairs-gemv": [
+    {
+      "median_ms": 2.372186,
+      "p95_ms": 2.403424,
+      "samples": 200,
+      "scope": "warm end-to-end, including transfers",
+      "setup_ms": 355.106629
+    },
+    {
+      "median_ms": 2.3479769999999998,
+      "p95_ms": 2.367436,
+      "samples": 200,
+      "scope": "warm end-to-end, including transfers",
+      "setup_ms": 356.40113499999995
+    }
+  ],
+  "pairs-split": [
+    {
+      "median_ms": 2.407485,
+      "p95_ms": 2.431974,
+      "samples": 200,
+      "scope": "warm end-to-end, including transfers",
+      "setup_ms": 364.864354
+    },
+    {
+      "median_ms": 2.3840049999999997,
+      "p95_ms": 2.420134,
+      "samples": 200,
+      "scope": "warm end-to-end, including transfers",
+      "setup_ms": 356.404174
+    }
+  ]
+}

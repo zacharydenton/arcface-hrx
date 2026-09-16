@@ -46,9 +46,20 @@ fn production_host_alignment_quality_gate() -> Result<()> {
         let reference = model.embeddings(&crops)?;
         // Prepare the image/landmark shape and model once before warm timing.
         let _ = model.embed(&rgb, fixture.width, fixture.height, &fixture.landmarks)?;
+        let before = model.context().runtime().statistics();
         let start = Instant::now();
         let actual = model.embed(&rgb, fixture.width, fixture.height, &fixture.landmarks)?;
         let device_time = start.elapsed();
+        let after = model.context().runtime().statistics();
+        assert_eq!(
+            after.allocations, before.allocations,
+            "warm alignment allocations"
+        );
+        assert_eq!(after.native_graphs_prepared, before.native_graphs_prepared);
+        assert_eq!(after.device_copied_bytes, before.device_copied_bytes);
+        assert_eq!(after.submissions - before.submissions, 1);
+        assert_eq!(after.uploaded_bytes, before.uploaded_bytes);
+        assert_eq!(after.downloaded_bytes, before.downloaded_bytes);
         let start = Instant::now();
         let _ = model.embeddings(&crops)?;
         let host_embedding_time = start.elapsed();
