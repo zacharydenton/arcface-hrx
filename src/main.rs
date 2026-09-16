@@ -39,7 +39,7 @@ fn main() -> Result<()> {
         input.len().is_multiple_of(SIZE * SIZE * 3),
         "input must be packed 112×112 RGB crops"
     );
-    let mut model = ArcFace::load(
+    let model = ArcFace::load(
         &model_path,
         Options {
             device: args.device,
@@ -53,7 +53,7 @@ fn main() -> Result<()> {
             serde_json::to_string(&model.benchmark(&input, args.benchmark)?)?
         );
     }
-    let mut run = || model.embeddings(&input);
+    let run = || model.embeddings(&input);
     let output = run()?;
     if let Some(path) = args.output {
         std::fs::write(path, bytemuck::cast_slice(&output))?;

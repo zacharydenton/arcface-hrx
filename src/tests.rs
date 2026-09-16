@@ -34,8 +34,8 @@ fn rgb_conversion_and_padding() -> Result<()> {
         engine.replay(1)?;
         let mut bytes = vec![0u8; output.len()];
         engine.read_many(&mut [(output, &mut bytes)])?;
-        for (p, pixel) in bytes.chunks_exact(16).enumerate() {
-            for (c, value) in pixel.chunks_exact(2).enumerate() {
+        for (p, pixel) in bytes.as_chunks::<16>().0.iter().enumerate() {
+            for (c, value) in pixel.as_chunks::<2>().0.iter().enumerate() {
                 let expected = if c < 3 {
                     (rgb[p * 3 + c] as f32 - 127.5) / 127.5
                 } else {
@@ -80,7 +80,7 @@ fn cosine(a: &[f32], b: &[f32]) -> f64 {
 fn native_reference_and_replay() -> Result<()> {
     use tract_onnx::prelude::*;
     let path = model_path()?;
-    let mut model = ArcFace::load(
+    let model = ArcFace::load(
         &path,
         Options {
             device: 0,
@@ -248,8 +248,138 @@ fn landmark_fixture() -> Result<()> {
         let want: [[f64; 3]; 2] = serde_json::from_value(face["M"].clone())?;
         let got = alignment::transform(&points)?;
         for (a, b) in got.iter().flatten().zip(want.iter().flatten()) {
-            assert!((a - b).abs() < 2e-4, "alignment delta {}", (a - b).abs());
+            let delta = (f64::from(*a) - b).abs();
+            assert!(delta < 2e-4, "alignment delta {delta}");
         }
+    }
+    Ok(())
+}
+
+fn compare_alignment_crops(
+    label: &str,
+    rgb: &[u8],
+    width: usize,
+    height: usize,
+    points: &[[f32; 2]; 5],
+    gpu: Option<(&hrx::image::ImageOps, &hrx::inference::ModelContext)>,
+) -> Result<()> {
+    let got = alignment::crop(rgb, width, height, points)?;
+    if let Some((ops, context)) = gpu {
+        let input = context.upload(
+            TensorDesc::new(DType::U8, vec![1, height, width, 3])?.with_layout(Layout::Nhwc)?,
+            rgb,
+        )?;
+        let landmarks = context.upload(
+            TensorDesc::new(DType::F32, vec![1, 5, 2])?,
+            bytemuck::cast_slice(points),
+        )?;
+        let fitted = ops.similarity_2d(&landmarks, &alignment::TEMPLATE)?;
+        let device = ops
+            .affine_rgb(
+                &input,
+                &fitted.outputs()[1],
+                112,
+                112,
+                hrx::image::RgbSampling::BlackTiesEven,
+            )?
+            .download()?
+            .wait()?
+            .remove(0);
+        let max = device
+            .iter()
+            .zip(&got)
+            .map(|(a, b)| a.abs_diff(*b))
+            .max()
+            .unwrap();
+        let changed = device.iter().zip(&got).filter(|(a, b)| a != b).count();
+        eprintln!("{label}: GPU/CPU FP32 {changed} changed channels, max delta {max}");
+        assert!(max <= 1, "{label}: GPU/CPU crop error {max}");
+    }
+    let old = alignment::reference::crop(rgb, width, height, points)?;
+    let differences: Vec<u8> = got.iter().zip(&old).map(|(a, b)| a.abs_diff(*b)).collect();
+    let changed = differences.iter().filter(|d| **d != 0).count();
+    let max = *differences.iter().max().unwrap();
+    let mean = differences.iter().map(|d| *d as f64).sum::<f64>() / differences.len() as f64;
+    eprintln!(
+        "{label}: {changed}/{} changed channels, max delta {max}, mean delta {mean:.6}",
+        got.len()
+    );
+    // Qualification bounds for these fixtures, not a universal FP32 guarantee.
+    // At half-integer pixel values, a tiny coordinate difference can change
+    // many rounded channels by one; changed-channel count is diagnostic only.
+    assert!(max <= 1, "{label}: max channel delta {max}");
+    Ok(())
+}
+
+#[test]
+fn fp32_alignment_crop_parity() -> Result<()> {
+    alignment_crop_parity(None)
+}
+
+#[test]
+#[ignore = "requires gfx1151 and Loom compiler"]
+fn gpu_alignment_crop_parity() -> Result<()> {
+    let context = ModelContext::new(hrx::execution::RuntimeOptions::default())?;
+    let ops = ImageOps::new(&context, 8)?;
+    alignment_crop_parity(Some((&ops, &context)))
+}
+
+fn alignment_crop_parity(gpu: Option<(&ImageOps, &ModelContext)>) -> Result<()> {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../tests/fixtures/t1_arcface.json"))?;
+    let image = image::load_from_memory(include_bytes!("../tests/fixtures/t1.png"))?.to_rgb8();
+    let (w, h) = image.dimensions();
+    for (i, face) in fixture["faces"].as_array().unwrap().iter().enumerate() {
+        compare_alignment_crops(
+            &format!("fixture face {i}"),
+            &image,
+            w as usize,
+            h as usize,
+            &serde_json::from_value(face["kps"].clone())?,
+            gpu,
+        )?;
+    }
+    for (label, width, height, scale, angle, tx, ty) in [
+        ("identity", 112, 112, 1., 0., 0., 0.),
+        ("fractional", 256, 256, 1., 0., 0.375, 0.125),
+        ("rotation", 256, 256, 1.5, 0.7, 100., 5.),
+        ("top-left border", 112, 112, 1., 0., -40.25, -30.75),
+        ("bottom-right border", 112, 112, 1., 0., 40.25, 30.75),
+        ("outside", 112, 112, 1., 0., -300., -300.),
+        ("large x", 8192, 256, 1.5, 0.2, 8000., 0.),
+        ("large y", 256, 8192, 1.5, -0.2, 0., 8000.),
+        ("small face", 112, 112, 0.0001, 0.3, 50., 50.),
+    ] {
+        let angle: f32 = angle;
+        let (sin, cos) = angle.sin_cos();
+        let points = alignment::TEMPLATE.map(|[x, y]| {
+            [
+                scale * (cos * x - sin * y) + tx,
+                scale * (sin * x + cos * y) + ty,
+            ]
+        });
+        let rgb: Vec<u8> = (0..width * height * 3)
+            .map(|i| ((i * 37 + i / 379) % 256) as u8)
+            .collect();
+        compare_alignment_crops(label, &rgb, width, height, &points, gpu)?;
+    }
+    let near_collinear = [
+        [20., 20.],
+        [40., 20.],
+        [60., 20.],
+        [80., 20.],
+        [100., 20.00001],
+    ];
+    let rgb: Vec<u8> = (0..112 * 112 * 3).map(|i| (i % 256) as u8).collect();
+    compare_alignment_crops("near collinear", &rgb, 112, 112, &near_collinear, gpu)?;
+    // Unrepresentable/overflowing or collapsed geometry must fail, not emit NaNs.
+    for points in [
+        [[f32::INFINITY; 2]; 5],
+        [[f32::MAX; 2]; 5],
+        [[8192.; 2]; 5],
+        alignment::TEMPLATE.map(|[x, y]| [x * 1e30, y * 1e30]),
+    ] {
+        assert!(alignment::crop(&rgb, 112, 112, &points).is_err());
     }
     Ok(())
 }
@@ -261,7 +391,13 @@ fn insightface_fixture() -> Result<()> {
     let image = image::load_from_memory(include_bytes!("../tests/fixtures/t1.png"))?.to_rgb8();
     let (w, h) = image.dimensions();
     let rgb = image.into_raw();
-    let mut model = ArcFace::load(model_path()?, Options::default())?;
+    let model = ArcFace::load(
+        model_path()?,
+        Options {
+            max_batch: 2,
+            ..Options::default()
+        },
+    )?;
     let mut expected = vec![];
     let mut landmarks = vec![];
     for face in fixture["faces"].as_array().unwrap() {
@@ -272,13 +408,47 @@ fn insightface_fixture() -> Result<()> {
             face["embedding"].clone(),
         )?);
     }
+    let before = model.context().runtime().statistics().downloaded_bytes;
     let got = model.embed(&rgb, w as usize, h as usize, &landmarks)?;
+    let readback = model.context().runtime().statistics().downloaded_bytes - before;
+    assert_eq!(
+        readback,
+        (landmarks.len() * (EMBEDDING + 1) * 4) as u64,
+        "only embeddings and geometry status cross back to the host"
+    );
+    assert_eq!(got, model.embed(&rgb, w as usize, h as usize, &landmarks)?);
+    let image = model.context().upload(
+        TensorDesc::new(DType::U8, vec![1, h as usize, w as usize, 3])?
+            .with_layout(Layout::Nhwc)?,
+        &rgb,
+    )?;
+    for count in [0, 3] {
+        let points = model
+            .context()
+            .allocate(TensorDesc::new(DType::F32, vec![count, 5, 2])?)?;
+        assert!(model.submit_image(&image, &points).is_err());
+    }
+    let points = model
+        .context()
+        .upload(TensorDesc::new(DType::F32, vec![1, 5, 2])?, &[0; 40])?;
+    assert!(model.submit_image(&image, &points)?.wait().is_err());
+    let mut legacy = Vec::new();
+    for points in &landmarks {
+        let crop = alignment::reference::crop(&rgb, w as usize, h as usize, points)?;
+        legacy.push(model.embeddings(&crop)?[0]);
+    }
+    for (i, (a, b)) in got.iter().zip(&legacy).enumerate() {
+        let similarity = cosine(a, b);
+        eprintln!("FP32/FP64 face {i}: embedding cosine {similarity:.12}");
+        assert!(similarity > 0.99995, "FP32/FP64 cosine {similarity}");
+    }
     for (a, b) in got.iter().zip(&expected) {
         assert!(cosine(a, b) > 0.99995, "cosine {}", cosine(a, b));
     }
     for i in 0..got.len() {
         for j in 0..got.len() {
             assert!((cosine(&got[i], &got[j]) - cosine(&expected[i], &expected[j])).abs() < 0.001);
+            assert!((cosine(&got[i], &got[j]) - cosine(&legacy[i], &legacy[j])).abs() < 0.001);
         }
     }
     Ok(())

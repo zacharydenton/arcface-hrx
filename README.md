@@ -37,7 +37,23 @@ vectors, matching InsightFace. Use `similarity` for cosine similarity.
 For unaligned images, `embed(image, width, height, landmarks)` accepts packed
 RGB and five landmarks per face. Pass the original RGB image and detections
 from [scrfd-hrx](https://github.com/zacharydenton/scrfd-hrx). `alignment::crop`
-exposes alignment separately.
+exposes alignment separately. Affine fitting, inversion and bilinear sampling
+use FP32, with black borders and ties-to-even rounding to RGB bytes;
+`alignment::transform` returns `[[f32; 3]; 2]`. Crops are numerically qualified
+against the FP64 reference, not promised to be pixel-identical.
+
+`embed` uploads the source image once, samples crops using HRX's shared GPU
+affine operation, and downloads only embeddings plus four geometry-status bytes
+per face. FP32 similarity fitting and inversion also run on GPU. For a shared
+device pipeline, load with `load_in(path, &context, max_batch)`
+and use `submit_image(&image, &landmarks)` with a resident U8 NHWC
+`[1,height,width,3]` image and F32 `[faces,5,2]` landmarks (strided detection-row
+views are accepted). It returns `FaceInference`; embeddings and geometry status
+stay resident, and `wait` checks geometry before returning results. `align`
+exposes resident crops and status separately; `submit` accepts
+already aligned resident crops. These device methods accept one nonempty batch
+up to `max_batch` and report bounded-capacity backpressure. The standalone
+`alignment::crop` function is an explicitly requested CPU utility, not a fallback.
 
 `Options` selects the device and resident batch size (default 16, range 1–64).
 Larger batches are chunked automatically. Activation memory is 3.8 MB per
