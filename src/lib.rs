@@ -2,7 +2,6 @@
 //! embeddings are 512 unnormalized float32 values, as in InsightFace.
 pub mod alignment;
 mod cnn;
-mod engine;
 pub mod hub;
 mod model;
 mod onnx;
@@ -79,9 +78,10 @@ impl ArcFace {
             "benchmark requires one nonempty batch"
         );
         self.embeddings(crops)?;
-        self.cnn
+        Ok(self
+            .cnn
             .engine
-            .benchmark(crops.len() / (SIZE * SIZE * 3), samples)
+            .benchmark(crops.len() / (SIZE * SIZE * 3), samples)?)
     }
     /// Align and embed faces from a packed RGB image and five landmarks per face.
     pub fn embed(
@@ -118,4 +118,4 @@ pub fn similarity(a: &[f32; EMBEDDING], b: &[f32; EMBEDDING]) -> Result<f64> {
 #[cfg(test)]
 mod tests;
 
-pub use engine::{Distribution, ForwardTimings};
+pub use hrx::loom::model::{Distribution, ForwardTimings};
