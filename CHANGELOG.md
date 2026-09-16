@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Use HRX 0.5's shared Hugging Face resolver, checked ONNX loader, scratch
+  planner, compiler selection, and top-level `hrx::model` API.
 - Accept packed RGB images and aligned crops in `embed`, `embeddings`, `alignment::crop`, and the CLI. BGR callers must swap red and blue before calling.
 - Normalize and pad each input pixel with one vector store in the GPU preprocessing kernel.
 - Return errors instead of panicking when malformed ONNX models pass non-spatial tensors to Transpose, pooling, or Resize.

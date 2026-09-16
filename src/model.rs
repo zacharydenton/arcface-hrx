@@ -1,26 +1,26 @@
 use crate::{
-    onnx::{Network, Node, NodeExt, TensorExt},
+    onnx::{Network, Node},
     plan::*,
 };
 use anyhow::{Context, Result, ensure};
 use std::{collections::HashMap, path::Path};
 fn bn(net: &Network, n: &Node) -> Result<(Vec<f64>, Vec<f64>)> {
     ensure!(
-        n.op_type == "BatchNormalization",
+        n.op_type() == "BatchNormalization",
         "expected BatchNormalization"
     );
-    let g = net.tensor(&n.input[1])?.floats()?;
-    let b = net.tensor(&n.input[2])?.floats()?;
-    let m = net.tensor(&n.input[3])?.floats()?;
-    let v = net.tensor(&n.input[4])?.floats()?;
+    let g = net.tensor(&n.inputs()[1])?.f64s()?;
+    let b = net.tensor(&n.inputs()[2])?.f64s()?;
+    let m = net.tensor(&n.inputs()[3])?.f64s()?;
+    let v = net.tensor(&n.inputs()[4])?.f64s()?;
     let mut scale = vec![];
     let mut shift = vec![];
     for i in 0..g.len() {
         ensure!(
-            v[i] + n.f("epsilon", 1e-5) > 0.,
+            v[i] + n.float("epsilon", 1e-5) > 0.,
             "invalid BatchNorm variance"
         );
-        let s = g[i] / (v[i] + n.f("epsilon", 1e-5)).sqrt();
+        let s = g[i] / (v[i] + n.float("epsilon", 1e-5)).sqrt();
         scale.push(s);
         shift.push(b[i] - m[i] * s);
     }
@@ -29,24 +29,19 @@ fn bn(net: &Network, n: &Node) -> Result<(Vec<f64>, Vec<f64>)> {
 pub(crate) fn load(path: &Path) -> Result<Plan> {
     let net = Network::load(path, 112)?;
     ensure!(
-        net.graph.output.len() == 1 && net.shape(&net.graph.output[0].name)? == [1, 512],
+        net.outputs().len() == 1 && net.shape(&net.outputs()[0])? == [1, 512],
         "expected w600k_r50 embedding output"
     );
     ensure!(
-        net.graph
-            .node
-            .iter()
-            .filter(|n| n.op_type == "Conv")
-            .count()
-            == 53,
+        net.nodes().iter().filter(|n| n.op_type() == "Conv").count() == 53,
         "expected 53 w600k_r50 convolutions"
     );
     let mut weights = HashMap::new();
-    let mut aliases = HashMap::from([(net.graph.input[0].name.clone(), "nhwc_input".into())]);
+    let mut aliases = HashMap::from([(net.inputs()[0].clone(), "nhwc_input".into())]);
     let mut ops = vec![Op {
         kind: "convert",
         name: "convert".into(),
-        src: net.graph.input[0].name.clone(),
+        src: net.inputs()[0].clone(),
         dst: "nhwc_input".into(),
         h: 112,
         w: 112,
@@ -56,23 +51,24 @@ pub(crate) fn load(path: &Path) -> Result<Plan> {
         ..Default::default()
     }];
     let mut index = 0;
-    for node in &net.graph.node {
-        match node.op_type.as_str() {
+    for node in net.nodes() {
+        match node.op_type() {
             "Conv" => {
                 let name = format!("c{index:02}");
                 index += 1;
-                let shape = net.tensor(&node.input[1])?.shape()?;
+                let shape = net.tensor(&node.inputs()[1])?.shape()?;
                 let (co, ci, taps) = (shape[0], shape[1], shape[2] * shape[3]);
-                let mut w = net.tensor(&node.input[1])?.floats()?;
-                let b = net.tensor(&node.input[2])?.floats()?;
+                let mut w = net.tensor(&node.inputs()[1])?.f64s()?;
+                let b = net.tensor(&node.inputs()[2])?.f64s()?;
                 let parent = net
-                    .producer(&node.input[0])
-                    .filter(|n| n.op_type == "BatchNormalization");
+                    .producer(&node.inputs()[0])
+                    .filter(|n| n.op_type() == "BatchNormalization");
+                let node_output = node.output()?;
                 let add = net
-                    .consumers(node.out())
-                    .find(|n| n.op_type == "Add" && n.input[0] == node.out());
-                let prelu = net.consumers(node.out()).find(|n| n.op_type == "PRelu");
-                let stride = node.ints("strides", &[1, 1])[0] as usize;
+                    .consumers(node_output)
+                    .find(|n| n.op_type() == "Add" && n.inputs()[0] == node_output);
+                let prelu = net.consumers(node_output).find(|n| n.op_type() == "PRelu");
+                let stride = node.integers("strides", &[1, 1])[0] as usize;
                 let variant = if taps == 1 {
                     "plain"
                 } else if add.is_some() {
@@ -93,7 +89,7 @@ pub(crate) fn load(path: &Path) -> Result<Plan> {
                 let mut bias = vec![0.; n * if parent.is_some() { 9 } else { 1 }];
                 let src = if let Some(bn_node) = parent {
                     ensure!(
-                        stride == 1 && net.consumers(bn_node.out()).count() == 1,
+                        stride == 1 && net.consumers(bn_node.output()?).count() == 1,
                         "unsupported BN-convolution fold"
                     );
                     let (scale, shift) = bn(&net, bn_node)?;
@@ -123,10 +119,10 @@ pub(crate) fn load(path: &Path) -> Result<Plan> {
                             }
                         }
                     }
-                    bn_node.input[0].clone()
+                    bn_node.inputs()[0].clone()
                 } else {
                     bias[..co].copy_from_slice(&b);
-                    node.input[0].clone()
+                    node.inputs()[0].clone()
                 };
                 if taps == 1 {
                     ensure!(stride == 2, "expected stride-2 shortcut");
@@ -141,30 +137,30 @@ pub(crate) fn load(path: &Path) -> Result<Plan> {
                 let mut extra = String::new();
                 if let Some(a) = add {
                     ensure!(
-                        net.consumers(node.out()).count() == 1,
+                        net.consumers(node.output()?).count() == 1,
                         "unfused convolution consumer"
                     );
-                    extra = a.input[1].clone();
-                    aliases.insert(a.out().into(), node.out().into());
+                    extra = a.inputs()[1].clone();
+                    aliases.insert(a.output()?.into(), node.output()?.into());
                 }
                 if let Some(p) = prelu {
                     ensure!(
-                        net.consumers(node.out()).count() == 1,
+                        net.consumers(node.output()?).count() == 1,
                         "unfused PRelu consumer"
                     );
                     let mut slopes = vec![0.; n];
-                    slopes[..co].copy_from_slice(&net.tensor(&p.input[1])?.floats()?);
+                    slopes[..co].copy_from_slice(&net.tensor(&p.inputs()[1])?.f64s()?);
                     emit32(&mut weights, format!("{name}_slope"), &slopes);
-                    aliases.insert(p.out().into(), node.out().into());
+                    aliases.insert(p.output()?.into(), node.output()?.into());
                 }
                 let s = net.shape(&src)?;
-                let out = net.shape(node.out())?;
+                let out = net.shape(node.output()?)?;
                 ops.push(Op {
                     kind: "conv",
                     variant,
                     name,
                     src,
-                    dst: node.out().into(),
+                    dst: node.output()?.into(),
                     extra,
                     h: s[2],
                     w: s[3],
@@ -183,30 +179,30 @@ pub(crate) fn load(path: &Path) -> Result<Plan> {
             }
             "Gemm" => {
                 let flat = net
-                    .producer(&node.input[0])
+                    .producer(&node.inputs()[0])
                     .context("missing head Flatten")?;
-                ensure!(flat.op_type == "Flatten", "expected head Flatten");
-                let before = net.producer(&flat.input[0]).context("missing head BN")?;
+                ensure!(flat.op_type() == "Flatten", "expected head Flatten");
+                let before = net.producer(&flat.inputs()[0]).context("missing head BN")?;
                 let after = net
-                    .consumers(node.out())
+                    .consumers(node.output()?)
                     .next()
                     .context("missing final BN")?;
                 ensure!(
-                    after.out() == net.graph.output[0].name
-                        && net.consumers(node.out()).count() == 1,
+                    after.output()? == net.outputs()[0]
+                        && net.consumers(node.output()?).count() == 1,
                     "unsupported head output"
                 );
                 ensure!(
-                    net.shape(&before.input[0])? == [1, 512, 7, 7],
+                    net.shape(&before.inputs()[0])? == [1, 512, 7, 7],
                     "expected 512×7×7 head input"
                 );
                 let (a1, s1) = bn(&net, before)?;
                 let (a2, s2) = bn(&net, after)?;
-                let w = net.tensor(&node.input[1])?.floats()?;
-                let bias = net.tensor(&node.input[2])?.floats()?;
+                let w = net.tensor(&node.inputs()[1])?.f64s()?;
+                let bias = net.tensor(&node.inputs()[2])?.f64s()?;
                 let (k, n) = (25088, 512);
                 ensure!(
-                    net.tensor(&node.input[1])?.shape()? == [n, k],
+                    net.tensor(&node.inputs()[1])?.shape()? == [n, k],
                     "unsupported head shape"
                 );
                 let mut packed = vec![0.; n * k];
@@ -227,7 +223,7 @@ pub(crate) fn load(path: &Path) -> Result<Plan> {
                 ops.push(Op {
                     kind: "head",
                     name: "fc".into(),
-                    src: before.input[0].clone(),
+                    src: before.inputs()[0].clone(),
                     dst: "partials".into(),
                     k,
                     n,

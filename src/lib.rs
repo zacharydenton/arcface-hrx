@@ -118,4 +118,4 @@ pub fn similarity(a: &[f32; EMBEDDING], b: &[f32; EMBEDDING]) -> Result<f64> {
 #[cfg(test)]
 mod tests;
 
-pub use hrx::loom::model::{Distribution, ForwardTimings};
+pub use hrx::{benchmark::Distribution, model::ForwardTimings};
