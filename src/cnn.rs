@@ -93,16 +93,11 @@ impl Cnn {
             };
             let dst = shaped(self.buffers[l.dst_buf])?;
             let m = batch * l.ho * l.wo;
-            let (scalar, grid, bindings) = match l.kind {
-                "convert" => (
-                    batch * l.h,
-                    [batch as u32 * l.h as u32, 1, 1],
-                    vec![src, dst],
-                ),
-                "pool" => (m, [(batch * l.ho) as u32, 1, 1], vec![src, dst]),
+            let (scalar, bindings) = match l.kind {
+                "convert" => (batch * l.h, vec![src, dst]),
+                "pool" => (m, vec![src, dst]),
                 "reduce" => (
                     batch,
-                    [batch as u32, 1, 1],
                     vec![src, self.weights[&(l.name.clone() + "_b")], dst],
                 ),
                 _ => {
@@ -119,15 +114,7 @@ impl Cnn {
                         args.push(self.weights[&(l.name.clone() + "_slope")]);
                     }
                     let m = if l.kind == "head" { batch } else { m };
-                    (
-                        m,
-                        [
-                            (l.n / if l.kind == "conv" { l.tile } else { 64 }) as u32,
-                            m.div_ceil(64) as u32,
-                            if l.kind == "head" { l.splits as u32 } else { 1 },
-                        ],
-                        args,
-                    )
+                    (m, args)
                 }
             };
             let bindings = bindings
@@ -140,9 +127,14 @@ impl Cnn {
                     }
                 })
                 .collect();
+            let scalar = u32::try_from(scalar)?;
+            let grid = self
+                .engine
+                .launch_config(self.kernels[kernel], &[u64::from(scalar)])?
+                .workgroup_count;
             commands.push(Command::Dispatch(Dispatch::indices(
                 self.kernels[kernel],
-                [scalar as u32],
+                [scalar],
                 grid,
                 bindings,
             )));

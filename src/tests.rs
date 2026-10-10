@@ -128,7 +128,7 @@ fn importer_liveness() -> Result<()> {
 }
 #[test]
 fn malformed_onnx_returns_errors() {
-    use onnx_protobuf::{GraphProto, Message, ModelProto, NodeProto, ValueInfoProto};
+    use hrx::artifacts::onnx::proto::{GraphProto, Message, ModelProto, NodeProto, ValueInfoProto};
     assert!(onnx::Network::from_bytes(&[], 112).is_err());
     assert!(onnx::Network::from_bytes(&[0x3a, 0xff], 112).is_err());
     let node = NodeProto {
@@ -153,7 +153,7 @@ fn malformed_onnx_returns_errors() {
 }
 #[test]
 fn spatial_operators_reject_flattened_input() -> Result<()> {
-    use onnx_protobuf::{
+    use hrx::artifacts::onnx::proto::{
         AttributeProto, GraphProto, Message, ModelProto, NodeProto, ValueInfoProto,
         attribute_proto::AttributeType,
     };

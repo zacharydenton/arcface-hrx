@@ -9,7 +9,7 @@ repository = "https://github.com/zacharydenton/arcface-hrx"
 include = ["src/**", "kernels/**", "tests/**", "docs/**", "Cargo.toml", "Cargo.lock", "README.md", "CHANGELOG.md", "LICENSE", "THIRD_PARTY_NOTICES.md"]
 
 [dependencies]
-hrx = { package = "hrx-rs", version = "0.8.7" }
+hrx = { package = "hrx-rs", version = "0.10.1" }
 anyhow = "1"
 half = { version = "2", features = ["bytemuck"] }
 bytemuck = "1"
@@ -22,6 +22,3 @@ nalgebra = "0.34"
 tempfile = "3"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 tract-onnx = "=0.22.1"
-onnx-protobuf = "0.2.3"
-# Test fixtures use the generated ONNX protobuf API directly.
-protobuf = "=3.4.0"

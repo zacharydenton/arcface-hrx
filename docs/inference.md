@@ -52,3 +52,10 @@ The full suite checks numerical references, face alignment, RGB conversion and
 graph replay. GPU tests require `gfx1151`; model tests download the pinned
 weights when needed, unless `ARCFACE_MODEL` supplies a local path. Run `cargo doc --open` for
 the API, and see [CHANGELOG.md](../CHANGELOG.md) for migrations.
+
+## Runtime
+
+Requires HRX 0.10.1. Graph preparation evaluates each Loom kernel's compiled
+launch metadata; cached inference reuses the resulting commands. Kernel tile
+sizes and workgroup dimensions have one source of truth in Loom. Convolution
+and projection accumulators remain FP32.
